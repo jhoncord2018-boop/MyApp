@@ -44,6 +44,47 @@ export const setLayerOpacity = async (settings: ConnectionSettings, layerIndex: 
     const url = `${getBaseUrl(settings)}/composition/layers/${layerIndex + 1}/video/opacity`;
     
     // Resolume expects the value directly or wrapped in an object depending on version.
-    // Standard v1 API usually accepts a simple numeric value or JSON object for PUT.
     await axios.put(url, { value: value });
+};
+
+export const triggerColumn = async (settings: ConnectionSettings, columnIndex: number) => {
+    // POST /composition/columns/{columnIndex}/connect
+    // API is 1-based for columns
+    const url = `${getBaseUrl(settings)}/composition/columns/${columnIndex + 1}/connect`;
+    await axios.post(url);
+};
+
+export const fetchClipThumbnail = async (settings: ConnectionSettings, layerIndex: number, clipIndex: number): Promise<string | null> => {
+    // GET /composition/layers/{layerId}/clips/{clipId}/thumbnail
+    // Returns binary image data
+    try {
+        const url = `${getBaseUrl(settings)}/composition/layers/${layerIndex + 1}/clips/${clipIndex + 1}/thumbnail`;
+        const response = await axios.get(url, { responseType: 'blob' });
+        if (response.data) {
+            return URL.createObjectURL(response.data);
+        }
+        return null;
+    } catch (e) {
+        // Thumbnail might not exist or connection failed
+        return null;
+    }
+};
+
+export const fetchCompositionThumbnail = async (settings: ConnectionSettings): Promise<string | null> => {
+    // GET /composition/thumbnail
+    // Returns binary image data for the master output
+    try {
+        const url = `${getBaseUrl(settings)}/composition/thumbnail`;
+        // We append a timestamp to prevent browser caching of the request
+        const response = await axios.get(url, { 
+            responseType: 'blob',
+            params: { t: Date.now() }
+        });
+        if (response.data) {
+            return URL.createObjectURL(response.data);
+        }
+        return null;
+    } catch (e) {
+        return null;
+    }
 };

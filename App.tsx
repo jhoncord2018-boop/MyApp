@@ -1,8 +1,9 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { ConnectionSettings, ResolumeComposition } from './types';
 import * as api from './services/resolumeService';
 import { SettingsModal } from './components/SettingsModal';
 import { LayerStrip } from './components/LayerStrip';
+import { ColumnHeader } from './components/ColumnHeader';
 
 // Default settings
 const DEFAULT_SETTINGS: ConnectionSettings = {
@@ -21,53 +22,147 @@ const App: React.FC = () => {
     const [isConnected, setIsConnected] = useState<boolean>(false);
     const [error, setError] = useState<string | null>(null);
     const [isSettingsOpen, setIsSettingsOpen] = useState<boolean>(false);
+    
+    // Feature States
+    const [thumbnails, setThumbnails] = useState<Record<string, string>>({});
+    const [areThumbnailsLoaded, setAreThumbnailsLoaded] = useState<boolean>(false);
+    
+    // Master Preview State
+    const [masterPreviewBlob, setMasterPreviewBlob] = useState<string | null>(null);
+    const activePreviewBlobRef = useRef<string | null>(null);
 
-    // Polling Reference
+    // Polling References
     const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
+    const previewRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
     // Fetch Data Logic
     const fetchData = async () => {
         try {
             const data = await api.fetchComposition(settings);
-            setComposition(data);
+            setComposition(prev => {
+                // If we are dragging a slider, we might want to defer updates, 
+                // but for now, we just overwrite. Ideally, we merge opacity if interacting.
+                // However, the optimistic update below handles the immediate interaction.
+                return data;
+            });
             setIsConnected(true);
             setError(null);
-            // If we successfully fetch, close settings if it was forced open due to error
             if (!isConnected && error) setIsSettingsOpen(false);
         } catch (err) {
             setIsConnected(false);
-            // Only set error if we were previously connected or if this is the initial attempt
-            // This prevents error flashing during simple network hiccups
-            // console.error(err); 
         }
     };
 
-    // Initialize & Polling Loop
+    // Initialize & Composition Polling
     useEffect(() => {
-        // Immediate fetch
         fetchData();
-
-        // Start polling
-        pollingRef.current = setInterval(fetchData, 500); // Poll every 500ms for high responsiveness
-
+        pollingRef.current = setInterval(fetchData, 500);
+        
         return () => {
             if (pollingRef.current) clearInterval(pollingRef.current);
         };
-    }, [settings]); // Re-run when settings change
+    }, [settings]);
+
+    // Master Preview Polling (Blob Strategy)
+    useEffect(() => {
+        if (!isConnected) return;
+
+        const updatePreview = async () => {
+            try {
+                // Fetch new blob
+                const blobUrl = await api.fetchCompositionThumbnail(settings);
+                if (blobUrl) {
+                    // Revoke old blob to prevent memory leak
+                    if (activePreviewBlobRef.current) {
+                        URL.revokeObjectURL(activePreviewBlobRef.current);
+                    }
+                    // Update state
+                    activePreviewBlobRef.current = blobUrl;
+                    setMasterPreviewBlob(blobUrl);
+                }
+            } catch (e) {
+                console.error("Preview fetch failed", e);
+            }
+        };
+
+        // Poll every 1 second (1000ms) as requested
+        previewRef.current = setInterval(updatePreview, 1000);
+        updatePreview(); // Initial fetch
+
+        return () => {
+            if (previewRef.current) clearInterval(previewRef.current);
+            // Cleanup blob on unmount/re-effect
+            if (activePreviewBlobRef.current) {
+                URL.revokeObjectURL(activePreviewBlobRef.current);
+                activePreviewBlobRef.current = null;
+            }
+        };
+    }, [settings, isConnected]);
+
+    // Load Clip Thumbnails Logic
+    useEffect(() => {
+        // Only load if connected, composition exists, and haven't loaded yet
+        if (isConnected && composition && !areThumbnailsLoaded) {
+            const loadAllThumbnails = async () => {
+                const newThumbnails: Record<string, string> = {};
+                const promises: Promise<void>[] = [];
+
+                composition.layers.forEach((layer, layerIdx) => {
+                    layer.clips.forEach((clip, clipIdx) => {
+                        const p = api.fetchClipThumbnail(settings, layerIdx, clipIdx)
+                            .then(url => {
+                                if (url) {
+                                    newThumbnails[`${layerIdx}-${clipIdx}`] = url;
+                                }
+                            });
+                        promises.push(p);
+                    });
+                });
+
+                await Promise.all(promises);
+                setThumbnails(prev => ({ ...prev, ...newThumbnails }));
+                setAreThumbnailsLoaded(true);
+            };
+
+            loadAllThumbnails();
+        }
+    }, [composition, isConnected, areThumbnailsLoaded, settings]);
+
+    // Cleanup object URLs for clip thumbnails on unmount
+    useEffect(() => {
+        return () => {
+            Object.values(thumbnails).forEach(url => URL.revokeObjectURL(url));
+        };
+    }, []); // Run only on unmount
+
+    // Derived State
+    const maxColumns = useMemo(() => {
+        if (!composition) return 0;
+        return Math.max(...composition.layers.map(l => l.clips.length), 0);
+    }, [composition]);
 
     // Handlers
     const handleSaveSettings = (newSettings: ConnectionSettings) => {
         setSettings(newSettings);
         localStorage.setItem('resolume_settings', JSON.stringify(newSettings));
         setIsSettingsOpen(false);
-        // Reset state to force a fresh connection attempt UI
         setComposition(null);
         setError(null);
+        
+        // Reset thumbnail state on new connection
+        setThumbnails({});
+        setAreThumbnailsLoaded(false);
+
+        // Reset Master Preview state
+        if (activePreviewBlobRef.current) {
+            URL.revokeObjectURL(activePreviewBlobRef.current);
+            activePreviewBlobRef.current = null;
+        }
+        setMasterPreviewBlob(null);
     };
 
     const handleTriggerClip = async (layerIdx: number, clipIdx: number) => {
         try {
-            // Optimistic UI update could go here, but Resolume is fast enough with 500ms polling usually
             await api.triggerClip(settings, layerIdx, clipIdx);
         } catch (e) {
             console.error("Failed to trigger clip", e);
@@ -82,25 +177,80 @@ const App: React.FC = () => {
         }
     };
 
-    const handleOpacityChange = async (layerIdx: number, value: number) => {
+    const handleTriggerColumn = async (colIdx: number) => {
         try {
-            // Immediate local update for smooth slider dragging (optional, simpler to just send)
+            await api.triggerColumn(settings, colIdx);
+        } catch (e) {
+            console.error("Failed to trigger column", e);
+        }
+    };
+
+    // FIXED: Optimistic UI Update for Opacity
+    const handleOpacityChange = async (layerIdx: number, value: number) => {
+        // 1. Optimistically update local state so the slider moves instantly
+        setComposition(prev => {
+            if (!prev) return null;
+            
+            // Create a deep copy of the layers to modify the specific opacity
+            const newLayers = prev.layers.map((layer, idx) => {
+                if (idx !== layerIdx) return layer;
+                return {
+                    ...layer,
+                    video: {
+                        ...layer.video,
+                        opacity: {
+                            ...layer.video.opacity,
+                            value: value
+                        }
+                    }
+                };
+            });
+
+            return { ...prev, layers: newLayers };
+        });
+
+        // 2. Send API request in background
+        try {
             await api.setLayerOpacity(settings, layerIdx, value);
         } catch (e) {
             console.error("Failed to set opacity", e);
+            // On error, the next polling cycle will revert the slider, which is acceptable behavior
         }
     };
 
     return (
-        <div className="flex flex-col h-screen bg-slate-950">
+        <div className="flex flex-col h-screen bg-slate-950 text-slate-200">
             {/* Header */}
-            <header className="bg-slate-900 border-b border-slate-800 p-4 flex items-center justify-between shrink-0">
-                <div className="flex items-center gap-3">
-                    <div className={`w-3 h-3 rounded-full ${isConnected ? 'bg-green-500 shadow-[0_0_10px_#22c55e]' : 'bg-red-500 animate-pulse'}`} />
-                    <h1 className="text-xl font-bold tracking-wider text-slate-100">
-                        RESO<span className="text-cyan-400">CTRL</span>
-                    </h1>
+            <header className="bg-slate-900 border-b border-slate-800 px-4 py-3 flex items-center justify-between shrink-0 z-30">
+                <div className="flex items-center gap-6">
+                    <div className="flex items-center gap-3">
+                        <div className={`w-3 h-3 rounded-full transition-colors duration-500 ${isConnected ? 'bg-green-500 shadow-[0_0_10px_#22c55e]' : 'bg-red-500 animate-pulse'}`} />
+                        <h1 className="text-xl font-bold tracking-wider text-slate-100 hidden sm:block">
+                            RESO<span className="text-cyan-400">CTRL</span>
+                        </h1>
+                    </div>
+                    
+                    {/* Master Preview Box (Mini) */}
+                    {isConnected && (
+                        <div className="hidden md:flex items-center gap-3 bg-black/40 p-1 rounded border border-slate-700">
+                            <span className="text-[10px] font-mono text-slate-500 uppercase px-1 transform -rotate-90">Master</span>
+                            <div className="w-24 h-14 bg-black relative rounded overflow-hidden">
+                                {masterPreviewBlob ? (
+                                    <img 
+                                        src={masterPreviewBlob} 
+                                        alt="Live Output" 
+                                        className="w-full h-full object-contain"
+                                    />
+                                ) : (
+                                    <div className="w-full h-full flex items-center justify-center bg-slate-900">
+                                        <div className="w-4 h-4 border-2 border-slate-700 border-t-cyan-500 rounded-full animate-spin"></div>
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+                    )}
                 </div>
+
                 <div className="flex items-center gap-4">
                     {!isConnected && (
                         <span className="text-xs text-red-400 hidden md:inline-block">
@@ -118,7 +268,7 @@ const App: React.FC = () => {
             </header>
 
             {/* Main Content */}
-            <main className="flex-1 overflow-y-auto custom-scrollbar relative">
+            <main className="flex-1 overflow-y-auto custom-scrollbar relative flex flex-col">
                 {!composition && !isConnected ? (
                     <div className="h-full flex flex-col items-center justify-center text-slate-500">
                         <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-cyan-500 mb-4"></div>
@@ -126,21 +276,20 @@ const App: React.FC = () => {
                         <p className="text-xs mt-2">Check your IP/Port settings.</p>
                     </div>
                 ) : composition ? (
-                    <div className="pb-20">
-                        {/* Composition Info */}
-                        <div className="p-4 bg-slate-900/50 mb-2">
-                            <h2 className="text-sm font-mono text-slate-400 uppercase tracking-widest">Composition</h2>
-                            <p className="text-lg text-white">{composition.name?.value || "Untitled"}</p>
+                    <div className="flex-1 flex flex-col pb-20">
+                        {/* Composition Info Banner */}
+                        <div className="p-4 bg-slate-900/50 flex items-center justify-between border-b border-slate-800">
+                            <div>
+                                <h2 className="text-xs font-mono text-slate-500 uppercase tracking-widest">Composition</h2>
+                                <p className="text-lg text-white font-bold">{composition.name?.value || "Untitled"}</p>
+                            </div>
                         </div>
 
-                        {/* Layers */}
-                        <div className="flex flex-col-reverse"> 
-                        {/* Flex-col-reverse because usually Layer 1 is at bottom visually in Resolume UI, 
-                            but standard VJ setup usually lists Layer 3 above Layer 1. 
-                            Let's keep standard array order (Layer 1 top) or reverse based on preference. 
-                            Resolume API returns Layer 1 at index 0. 
-                            Resolume GUI puts Layer 1 at bottom. Let's reverse to match GUI. 
-                        */}
+                        {/* Column Header Sticky Row */}
+                        <ColumnHeader numColumns={maxColumns} onTriggerColumn={handleTriggerColumn} />
+
+                        {/* Layers Container */}
+                        <div className="flex flex-col-reverse">
                             {composition.layers.map((layer, idx) => (
                                 <LayerStrip 
                                     key={layer.id} 
@@ -149,6 +298,7 @@ const App: React.FC = () => {
                                     onTriggerClip={handleTriggerClip}
                                     onClearLayer={handleClearLayer}
                                     onOpacityChange={handleOpacityChange}
+                                    thumbnails={thumbnails}
                                 />
                             ))}
                         </div>
