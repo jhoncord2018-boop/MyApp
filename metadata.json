@@ -1,0 +1,5 @@
+{
+  "name": "Resolume Web Controller",
+  "description": "A remote control interface for Resolume Arena/Avenue using the REST API.",
+  "requestFramePermissions": []
+}
